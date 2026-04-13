@@ -1,4 +1,5 @@
-# The genomic catalog of extreme environment microorganisms (SEMGC)
+# Standardized extremophilic genomic catalogueue (SEGC)
+
 
 ## 1. Quality control
 
