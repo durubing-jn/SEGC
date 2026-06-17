@@ -1,268 +1,639 @@
-# Standardized extremophilic genomic catalogueue (SEGC)
+# SEGC workflow
 
+This document describes the reproducible workflow used to construct the Standardized Extremophilic Genomic Catalogue (SEGC) and to analyse biosynthetic gene clusters (BGCs) from paired-end metagenomic reads.
 
-## 1. Quality control
+The workflow starts from a single input directory:
 
-```sh
-## Only paired-end raw sequencing data were retained. The raw reads were quality-filtered using Trim Galore to obtain high-quality clean reads
-for i in $(cat sample_id); do
-trim_galore -o 01.clean.data --gzip --paired 00.raw_data/${i}_1.fastq.gz  00.raw_data/${i}_2.fastq.gz
+```text
+00.rawdata/
+├── SampleA_1.fq.gz
+├── SampleA_2.fq.gz
+├── SampleB_1.fq.gz
+└── SampleB_2.fq.gz
+```
+
+Read files must be named as `<sample_id>_1.fq.gz` and `<sample_id>_2.fq.gz`. All output directories are created by the commands below.
+
+## Software
+
+The versions below match the manuscript where applicable.
+
+```text
+Trim Galore v0.5.0
+MEGAHIT v1.1.3
+Seqtk v1.5.0
+Bowtie2 v2.3.5 or later
+SAMtools v1.9.0 or later
+BEDTools
+MetaBAT2 v2.12.1
+MaxBin2 v2.2.6
+CONCOCT v1.0.0
+DAS Tool v1.1.7
+CheckM v1.2.3
+CheckM2 v1.0.2
+Barrnap v0.9
+tRNAscan-SE v2.0.12
+dRep v3.4.5
+GTDB-Tk v2.4.0 with GTDB Release R226
+BMGE v1.12
+FastTree v2.1.10
+antiSMASH v7.0
+BiG-SCAPE v2.0 / BiG-SLiCE v2.0
+skani v0.3.0
+fastANI v1.33
+Prodigal v2.6.3
+PfamScan
+CLEAN v1.0.1
+GNU parallel
+```
+
+Before running, set project-level variables:
+
+```bash
+set -euo pipefail
+
+THREADS=${THREADS:-60}
+JOBS=${JOBS:-6}
+
+CHECKM2_DB=${CHECKM2_DB:-/path/to/CheckM2_database/uniref100.KO.1.dmnd}
+GTDBTK_DATA_PATH=${GTDBTK_DATA_PATH:-/path/to/gtdbtk/release226}
+PFAM_DB=${PFAM_DB:-/path/to/Pfam-A.hmm}
+PFAMSCAN_DB=${PFAMSCAN_DB:-/path/to/pfam_scan_db}
+
+export THREADS JOBS CHECKM2_DB GTDBTK_DATA_PATH PFAM_DB PFAMSCAN_DB
+```
+
+## 1. Prepare sample list
+
+```bash
+mkdir -p metadata
+
+find 00.rawdata -name "*_1.fq.gz" -type f \
+  | sed 's#^00.rawdata/##; s#_1.fq.gz$##' \
+  | sort > metadata/sample_ids.txt
+
+while read -r id; do
+  test -s "00.rawdata/${id}_1.fq.gz"
+  test -s "00.rawdata/${id}_2.fq.gz"
+done < metadata/sample_ids.txt
+```
+
+## 2. Quality control
+
+Raw reads are quality-filtered with Trim Galore to remove adapters and low-quality bases.
+
+```bash
+mkdir -p 01.clean_reads
+
+parallel -j "${JOBS}" \
+  'trim_galore --paired --gzip -q 20 -o 01.clean_reads \
+    00.rawdata/{1}_1.fq.gz 00.rawdata/{1}_2.fq.gz' \
+  :::: metadata/sample_ids.txt
+```
+
+## 3. Per-sample assembly
+
+Each sample is assembled independently with MEGAHIT.
+
+```bash
+mkdir -p 02.assembly_megahit
+
+parallel -j "${JOBS}" \
+  'megahit \
+    -1 01.clean_reads/{1}_1_val_1.fq.gz \
+    -2 01.clean_reads/{1}_2_val_2.fq.gz \
+    -t "${THREADS}" \
+    -o 02.assembly_megahit/{1}' \
+  :::: metadata/sample_ids.txt
+```
+
+## 4. Filter contigs
+
+Only contigs longer than 1,500 bp are retained for binning and downstream analyses.
+
+```bash
+mkdir -p 03.contigs_1500
+
+parallel -j "${JOBS}" \
+  'seqtk seq -L 1500 02.assembly_megahit/{1}/final.contigs.fa \
+    > 03.contigs_1500/{1}.contigs.1500.fa' \
+  :::: metadata/sample_ids.txt
+```
+
+## 5. Map clean reads to contigs
+
+Clean reads are mapped back to their own assembly once. The sorted BAM, MetaBAT2 depth table, MaxBin2 coverage table and CONCOCT coverage table generated here are reused by the three binning algorithms.
+
+```bash
+mkdir -p \
+  04.mapping/index \
+  04.mapping/sam \
+  04.mapping/bam \
+  04.mapping/depth \
+  04.mapping/maxbin_coverage \
+  04.mapping/stat
+
+while read -r id; do
+  bowtie2-build \
+    -f "03.contigs_1500/${id}.contigs.1500.fa" \
+    --threads "${THREADS}" \
+    "04.mapping/index/${id}.contigs.1500"
+
+  bowtie2 \
+    -x "04.mapping/index/${id}.contigs.1500" \
+    -1 "01.clean_reads/${id}_1_val_1.fq.gz" \
+    -2 "01.clean_reads/${id}_2_val_2.fq.gz" \
+    -p "${THREADS}" \
+    -S "04.mapping/sam/${id}.sam" \
+    2> "04.mapping/stat/${id}.bowtie2.stat"
+
+  samtools view \
+    -@ "${THREADS}" \
+    -b \
+    -S "04.mapping/sam/${id}.sam" \
+    -o "04.mapping/bam/${id}.bam"
+
+  samtools sort \
+    -@ "${THREADS}" \
+    -l 9 \
+    -O BAM \
+    "04.mapping/bam/${id}.bam" \
+    -o "04.mapping/bam/${id}.sorted.bam"
+
+  samtools index \
+    "04.mapping/bam/${id}.sorted.bam" \
+    -@ "${THREADS}"
+
+  jgi_summarize_bam_contig_depths \
+    --outputDepth "04.mapping/depth/${id}.depth.txt" \
+    "04.mapping/bam/${id}.sorted.bam"
+
+  genomeCoverageBed \
+    -ibam "04.mapping/bam/${id}.sorted.bam" \
+    > "04.mapping/maxbin_coverage/${id}.histogram.tab"
+
+  python ./calculate-contig-coverage.py \
+    "04.mapping/maxbin_coverage/${id}.histogram.tab"
+
+  rm -f "04.mapping/sam/${id}.sam" "04.mapping/bam/${id}.bam"
+done < metadata/sample_ids.txt
+```
+
+## 6. Genome binning
+
+Three complementary binning algorithms are used: MetaBAT2, MaxBin2 and CONCOCT.
+
+### 6.1 MetaBAT2
+
+```bash
+mkdir -p 05.binning/metabat2
+
+while read -r id; do
+  mkdir -p "05.binning/metabat2/${id}"
+
+  metabat2 \
+    -m 1500 \
+    -t "${THREADS}" \
+    -i "03.contigs_1500/${id}.contigs.1500.fa" \
+    -a "04.mapping/depth/${id}.depth.txt" \
+    -o "05.binning/metabat2/${id}/${id}.metabat2" \
+    -v
+done < metadata/sample_ids.txt
+```
+
+### 6.2 MaxBin2
+
+```bash
+mkdir -p 05.binning/maxbin2
+
+while read -r id; do
+  mkdir -p "05.binning/maxbin2/${id}"
+
+  run_MaxBin.pl \
+    -contig "03.contigs_1500/${id}.contigs.1500.fa" \
+    -abund "04.mapping/maxbin_coverage/${id}.histogram.tab.coverage.tab" \
+    -max_iteration 50 \
+    -out "05.binning/maxbin2/${id}/${id}.maxbin2" \
+    -thread "${THREADS}"
+done < metadata/sample_ids.txt
+```
+
+### 6.3 CONCOCT
+
+```bash
+mkdir -p 05.binning/concoct 05.binning/concoct_work
+
+while read -r id; do
+  mkdir -p "05.binning/concoct/${id}" "05.binning/concoct_work/${id}"
+
+  cut_up_fasta.py \
+    "03.contigs_1500/${id}.contigs.1500.fa" \
+    -c 10000 \
+    -o 0 \
+    --merge_last \
+    -b "05.binning/concoct_work/${id}/${id}.contigs_10K.bed" \
+    > "05.binning/concoct_work/${id}/${id}.contigs_10K.fa"
+
+  concoct_coverage_table.py \
+    "05.binning/concoct_work/${id}/${id}.contigs_10K.bed" \
+    "04.mapping/bam/${id}.sorted.bam" \
+    > "05.binning/concoct_work/${id}/${id}.coverage_table.tsv"
+
+  concoct \
+    --composition_file "05.binning/concoct_work/${id}/${id}.contigs_10K.fa" \
+    --coverage_file "05.binning/concoct_work/${id}/${id}.coverage_table.tsv" \
+    -b "05.binning/concoct_work/${id}/${id}.concoct_output" \
+    --threads "${THREADS}"
+
+  merge_cutup_clustering.py \
+    "05.binning/concoct_work/${id}/${id}.concoct_output_clustering_gt1000.csv" \
+    > "05.binning/concoct_work/${id}/${id}.clustering_merged.csv"
+
+  extract_fasta_bins.py \
+    "03.contigs_1500/${id}.contigs.1500.fa" \
+    "05.binning/concoct_work/${id}/${id}.clustering_merged.csv" \
+    --output_path "05.binning/concoct/${id}"
+done < metadata/sample_ids.txt
+```
+
+## 7. Integrate bins with DAS Tool
+
+```bash
+mkdir -p 06.das_tool/scaffolds2bin 06.das_tool/results 07.MAGs/raw_bins
+
+parallel -j "${JOBS}" \
+  'Fasta_to_Contig2Bin.sh -i 05.binning/maxbin2/{1} -e fasta \
+    > 06.das_tool/scaffolds2bin/{1}.maxbin2.tsv
+   Fasta_to_Contig2Bin.sh -i 05.binning/metabat2/{1} -e fa \
+    > 06.das_tool/scaffolds2bin/{1}.metabat2.tsv
+   Fasta_to_Contig2Bin.sh -i 05.binning/concoct/{1} -e fa \
+    > 06.das_tool/scaffolds2bin/{1}.concoct.tsv
+   DAS_Tool \
+    -i 06.das_tool/scaffolds2bin/{1}.maxbin2.tsv,06.das_tool/scaffolds2bin/{1}.metabat2.tsv,06.das_tool/scaffolds2bin/{1}.concoct.tsv \
+    -l maxbin2,metabat2,concoct \
+    -c 03.contigs_1500/{1}.contigs.1500.fa \
+    -o 06.das_tool/results/{1}.DASTool \
+    --threads "${THREADS}" \
+    --write_bins \
+    --score_threshold 0' \
+  :::: metadata/sample_ids.txt
+
+find 06.das_tool/results -path "*_DASTool_bins/*.fa" -type f \
+  | while read -r bin; do
+      sample=$(basename "$(dirname "$bin")" _DASTool_bins)
+      cp "$bin" "07.MAGs/raw_bins/${sample}__$(basename "$bin")"
+    done
+```
+
+## 8. MAG quality assessment
+
+MAG quality is assessed by both CheckM1 and CheckM2. Medium-quality MAGs are retained only if both tools report completeness >=50% and contamination <=10%.
+
+```bash
+mkdir -p 08.quality/checkm1 08.quality/checkm2 09.MAGs/medium_quality
+
+checkm lineage_wf \
+  -x fa \
+  -t "${THREADS}" \
+  --tmpdir 08.quality/checkm1/tmp \
+  07.MAGs/raw_bins \
+  08.quality/checkm1
+
+checkm qa \
+  08.quality/checkm1/lineage.ms \
+  08.quality/checkm1 \
+  --tab_table \
+  -o 2 \
+  -f 08.quality/checkm1/checkm1_qa.tsv
+
+checkm2 predict \
+  --threads "${THREADS}" \
+  -x fa \
+  -i 07.MAGs/raw_bins \
+  -o 08.quality/checkm2 \
+  --database_path "${CHECKM2_DB}"
+
+python3 - <<'PY'
+from pathlib import Path
+import csv
+import shutil
+
+raw_dir = Path("07.MAGs/raw_bins")
+out_dir = Path("09.MAGs/medium_quality")
+out_dir.mkdir(parents=True, exist_ok=True)
+
+checkm1 = {}
+with open("08.quality/checkm1/checkm1_qa.tsv", newline="") as f:
+    reader = csv.DictReader(f, delimiter="\t")
+    for row in reader:
+        name = row.get("Bin Id") or row.get("Bin")
+        if not name:
+            continue
+        checkm1[name] = (
+            float(row["Completeness"]),
+            float(row["Contamination"]),
+        )
+
+checkm2 = {}
+with open("08.quality/checkm2/quality_report.tsv", newline="") as f:
+    reader = csv.DictReader(f, delimiter="\t")
+    for row in reader:
+        name = row.get("Name") or row.get("Bin Id")
+        if not name:
+            continue
+        checkm2[name] = (
+            float(row["Completeness"]),
+            float(row["Contamination"]),
+        )
+
+kept = []
+for fasta in raw_dir.glob("*.fa"):
+    name = fasta.stem
+    if name not in checkm1 or name not in checkm2:
+        continue
+    c1, x1 = checkm1[name]
+    c2, x2 = checkm2[name]
+    if c1 >= 50 and x1 <= 10 and c2 >= 50 and x2 <= 10:
+        shutil.copy2(fasta, out_dir / fasta.name)
+        kept.append(name)
+
+Path("09.MAGs/medium_quality_MAGs.txt").write_text("\n".join(sorted(kept)) + "\n")
+print(f"Retained {len(kept)} medium-quality MAGs")
+PY
+```
+
+High-quality MAGs can be identified with the MIMAG criteria: completeness >90%, contamination <5%, at least 18 tRNAs, and 5S/16S/23S rRNAs.
+
+```bash
+mkdir -p 08.quality/barrnap 08.quality/trnascan
+
+find 09.MAGs/medium_quality -name "*.fa" -type f \
+  | sed 's#^09.MAGs/medium_quality/##; s#.fa$##' \
+  | sort > metadata/medium_quality_MAG_ids.txt
+
+parallel -j "${JOBS}" \
+  'barrnap --kingdom bac --reject 0.01 --evalue 1e-3 \
+    09.MAGs/medium_quality/{1}.fa \
+    > 08.quality/barrnap/{1}.bac.gff || true
+   barrnap --kingdom arc --reject 0.01 --evalue 1e-3 \
+    09.MAGs/medium_quality/{1}.fa \
+    > 08.quality/barrnap/{1}.arc.gff || true
+   tRNAscan-SE -B -o 08.quality/trnascan/{1}.bac.tsv \
+    09.MAGs/medium_quality/{1}.fa || true
+   tRNAscan-SE -A -o 08.quality/trnascan/{1}.arc.tsv \
+    09.MAGs/medium_quality/{1}.fa || true' \
+  :::: metadata/medium_quality_MAG_ids.txt
+```
+
+## 9. Species-level genome bins and taxonomy
+
+Medium-quality MAGs are dereplicated into species-level genome bins (SGBs) at 95% ANI.
+
+```bash
+mkdir -p 10.SGBs
+
+dRep dereplicate \
+  10.SGBs/dRep95 \
+  -g 09.MAGs/medium_quality/*.fa \
+  -p "${THREADS}" \
+  --ignoreGenomeQuality \
+  -pa 0.9 \
+  -sa 0.95 \
+  -nc 0.3
+
+mkdir -p 10.SGBs/representatives
+cp 10.SGBs/dRep95/dereplicated_genomes/*.fa 10.SGBs/representatives/
+
+gtdbtk classify_wf \
+  --genome_dir 10.SGBs/representatives \
+  --out_dir 11.taxonomy_gtdbtk \
+  --cpus "${THREADS}" \
+  --pplacer_cpus "${THREADS}" \
+  --skip_ani_screen \
+  --extension fa
+```
+
+Novel SGBs are defined as representative genomes with ANI <95% and alignment fraction <30% relative to GTDB reference genomes. Habitat-specific SGBs are SGBs whose member MAGs all originate from the same habitat.
+
+## 10. Phylogenetic trees
+
+GTDB-Tk marker alignments are trimmed with BMGE and trees are inferred with FastTree.
+
+```bash
+mkdir -p 12.phylogeny
+
+for aln in 11.taxonomy_gtdbtk/align/gtdbtk.bac120.user_msa.fasta.gz \
+           11.taxonomy_gtdbtk/align/gtdbtk.ar53.user_msa.fasta.gz; do
+  if [ -s "$aln" ]; then
+    gzip -dc "$aln" > "12.phylogeny/$(basename "$aln" .gz)"
+  fi
 done
 
+if [ -s 12.phylogeny/gtdbtk.bac120.user_msa.fasta ]; then
+  bmge -i 12.phylogeny/gtdbtk.bac120.user_msa.fasta \
+    -t AA -g 0.5 -h 1 -b 1 -w 1 \
+    -of 12.phylogeny/gtdbtk.bac120.trimmed.fasta
+  FastTree 12.phylogeny/gtdbtk.bac120.trimmed.fasta \
+    > 12.phylogeny/bac120.SEGC.tree
+fi
+
+if [ -s 12.phylogeny/gtdbtk.ar53.user_msa.fasta ]; then
+  bmge -i 12.phylogeny/gtdbtk.ar53.user_msa.fasta \
+    -t AA -g 0.5 -h 1 -b 1 -w 1 \
+    -of 12.phylogeny/gtdbtk.ar53.trimmed.fasta
+  FastTree 12.phylogeny/gtdbtk.ar53.trimmed.fasta \
+    > 12.phylogeny/ar53.SEGC.tree
+fi
 ```
 
-## 2. *de novo* assembly
+## 11. BGC discovery with antiSMASH
 
-```SH
-##MEGAHIT was used to assemble the clean data, as it is particularly suitable for large-sample analyses
-for i in $(cat sample_id); do
-megahit -1 01.clean.data/${i}_1_val_1.fq.gz -2 01.clean.data/${i}_2_val_2.fq.gz -t 80 -o 02.assembly_megahit/${i}_assembly
+antiSMASH is run on all retained medium-quality MAGs.
+
+```bash
+mkdir -p 13.BGC/antismash 13.BGC/gbk
+
+parallel -j "${JOBS}" \
+  'antismash \
+    09.MAGs/medium_quality/{1}.fa \
+    --taxon bacteria \
+    --output-dir 13.BGC/antismash/{1} \
+    --genefinding-tool prodigal \
+    --cb-knownclusters \
+    --cc-mibig \
+    --fullhmmer \
+    -c 1' \
+  :::: metadata/medium_quality_MAG_ids.txt
+
+find 13.BGC/antismash -name "*.region*.gbk" -type f \
+  | while read -r gbk; do
+      mag=$(basename "$(dirname "$gbk")")
+      cp "$gbk" "13.BGC/gbk/${mag}__$(basename "$gbk")"
+    done
+```
+
+## 12. GCF clustering with BiG-SCAPE
+
+BGCs are grouped into gene cluster families (GCFs). The manuscript used c = 0.3 and c = 0.7 for GCF-level analyses.
+
+```bash
+mkdir -p 14.GCF
+
+for cutoff in 0.3 0.7; do
+  bigscape cluster \
+    -i 13.BGC/gbk \
+    -o "14.GCF/bigscape_c${cutoff}" \
+    -p "${PFAM_DB}" \
+    -c "${THREADS}" \
+    --gcf-cutoffs "${cutoff}" \
+    --mix \
+    --alignment-mode local \
+    --extend-strategy greedy \
+    --classify category \
+    --include-singletons
 done
 ```
 
-## 3. Contig length filtering
+GCFs containing BGCs from one habitat are defined as habitat-specific GCFs. GCFs containing BGCs from more than one habitat are defined as multi-habitat GCFs.
 
-```sh
-#First, the assembled contigs were extracted, and then length filtering was performed using Seqtk with a minimum length threshold of 1,500 bp
-##
-for i in $(cat sample_id); do 
-cp 02.assembly_megahit/${i}_assembly/final.contigs.fa 03.seqtk_results/${i}.fa
+## 13. Comparison with external genome catalogues
+
+This step compares SEGC SGB representatives with external genome catalogues using skani for candidate search and fastANI for final ANI estimation.
+
+Prepare one genome list per external catalogue:
+
+```text
+external_catalogues/
+├── aquatic.genome_list.txt
+├── crop_root.genome_list.txt
+├── human.genome_list.txt
+├── ocean.genome_list.txt
+├── soil.genome_list.txt
+└── EEMC.genome_list.txt
+```
+
+Each list should contain absolute or project-relative FASTA paths, one genome per line.
+
+```bash
+mkdir -p 15.catalogue_compare/skani_refs 15.catalogue_compare/skani_hits 15.catalogue_compare/fastani
+
+find 10.SGBs/representatives -name "*.fa" -type f \
+  | sort > 15.catalogue_compare/SEGC_SGB_representatives.txt
+
+for list in external_catalogues/*.genome_list.txt; do
+  name=$(basename "$list" .genome_list.txt)
+  skani sketch -l "$list" -o "15.catalogue_compare/skani_refs/${name}" -t "${THREADS}" --slow
+  skani search \
+    -d "15.catalogue_compare/skani_refs/${name}" \
+    -l 15.catalogue_compare/SEGC_SGB_representatives.txt \
+    -o "15.catalogue_compare/skani_hits/${name}.skani.tsv" \
+    -t "${THREADS}"
 done
-##
-for i in $(cat sample_id); do
-seqtk seq -L 1500 03.seqtk_results/${i}.fa > 03.seqtk_results/${i}_l.fa
-done
 ```
 
-## 4. Binning analysis
+For final species assignment, recompute ANI for candidate matches with fastANI using `--minFraction 0.3 --fragLen 1500`. SGBs sharing >=95% ANI with any genome in a reference catalogue are considered present in that catalogue.
 
-```sh
-## Metagenomic binning was performed using three different methods: MetaBAT2, MaxBin, and CONCOCT.
-for i in $(cat sample_id); do 
-mkdir 05.binning/metabat2_bin/${i}
-mkdir 05.binning/MaxBin_bin/${i}
-mkdir 05.binning/concoct_bin/${i}
-##metabat2
-bowtie2-build -f 03.seqtk_results/${i}_l.fa --threads 10 05.binning/MaxBin_bin/${i}/${i}_final
-bowtie2 -1 01.clean.data/${i}_1_val_1.fq.gz -2 01.clean.data/${i}_2_val_2.fq.gz -p 10 -x 05.binning/MaxBin_bin/${i}/${i}_final -S 05.binning/MaxBin_bin/${i}/${i}_final.sam 2>0_SAM/${i}.bowtie2.stat
-samtools view -@ 10 -b -S 05.binning/MaxBin_bin/${i}/${i}_final.sam -o 05.binning/MaxBin_bin/${i}/${i}_final.bam
-samtools sort -@ 10 -l 9 -O BAM 05.binning/MaxBin_bin/${i}/${i}_final.bam -o 05.binning/MaxBin_bin/${i}/${i}_final.sorted.bam
-jgi_summarize_bam_contig_depths --outputDepth 05.binning/MaxBin_bin/${i}/${i}_final.depth.txt 05.binning/MaxBin_bin/${i}/${i}_final.sorted.bam
-metabat2 -m 1500 -t 10 -i 03.seqtk_results/${i}_l.fa -a 05.binning/MaxBin_bin/${i}/${i}_final.depth.txt -o 05.binning/metabat2_bin/${i}/${i}_metabat2 -v
-##MaxBin
-genomeCoverageBed -ibam 05.binning/MaxBin_bin/${i}/${i}_final.sorted.bam > 05.binning/MaxBin_bin/${i}/${i}.histogram.tab
-python ./calculate-contig-coverage.py 05.binning/MaxBin_bin/${i}/${i}.histogram.tab
-run_MaxBin.pl -contig 03.seqtk_results/${i}_l.fa -abund 05.binning/MaxBin_bin/${i}/${i}.histogram.tab.coverage.tab -max_iteration 50 -out 05.binning/MaxBin_bin/${i}/${i}_MaxBin -thread 10
-##concoct
-cut_up_fasta.py 03.seqtk_results/${i}_l.fa -c 10000 -o 0 --merge_last -b 05.binning/MaxBin_bin/${i}/${i}.contigs_10K.bed > 05.binning/MaxBin_bin/${i}/${i}.contigs_10K.fa
-samtools index 05.binning/MaxBin_bin/${i}/${i}_final.sorted.bam -@ 10
-concoct_coverage_table.py 05.binning/MaxBin_bin/${i}/${i}.contigs_10K.bed 05.binning/MaxBin_bin/${i}/${i}_final.sorted.bam > 05.binning/MaxBin_bin/${i}/${i}.coverage_table.tsv
-concoct --composition_file 05.binning/MaxBin_bin/${i}/${i}.contigs_10K.fa --coverage_file 05.binning/MaxBin_bin/${i}/${i}.coverage_table.tsv -b 05.binning/MaxBin_bin/${i}/${i}.concoct_output --threads 10
-merge_cutup_clustering.py 05.binning/MaxBin_bin/${i}/${i}.concoct_output_clustering_gt1000.csv > 05.binning/MaxBin_bin/${i}/${i}.clustering_merged.csv
-extract_fasta_bins.py 03.seqtk_results/${i}_l.fa 05.binning/MaxBin_bin/${i}/${i}.clustering_merged.csv --output_path 05.binning/concoct_bin/${i}
-done
+## 14. Terpene pathway reconstruction
 
+Terpene BGC proteins are annotated with CLEAN at medium confidence (confidence >=0.2). Predicted EC numbers are mapped to curated terpene marker genes from KEGG and MetaCyc to identify terpene classes and specific pathways such as retinal biosynthesis.
+
+```bash
+mkdir -p 17.terpene/proteins 17.terpene/clean
+
+# Example: run CLEAN on a FASTA file of terpene BGC proteins.
+CLEAN_infer_fasta.py \
+  --fasta_data 17.terpene/proteins/SEGC.terpene.proteins.fasta \
+  --out_dir 17.terpene/clean
 ```
 
-## 5. Refinement
+## 15. Metatranscriptomic validation
 
-```sh
-## DAS_Tool was used to integrate and de-replicate the binning results obtained from the different tools
-for i in $(cat sample_id); do
-Fasta_to_Contig2Bin.sh -i 04.binning/MaxBin_bin/${i} -e fasta > 06.das_tool/${i}_maxbin.scaffolds2bin.tsv
-Fasta_to_Contig2Bin.sh -i 04.binning/metabat2_bin/${i} -e fa > 06.das_tool/${i}_metabat2.scaffolds2bin.tsv
-Fasta_to_Contig2Bin.sh -i 04.binning/concoct_bin/${i} -e fa > 06.das_tool/${i}_concoct.scaffolds2bin.tsv
-done
+For matched metatranscriptomes, raw RNA reads are processed with Trim Galore. Clean reads are mapped to beta-carotene dioxygenase and bacteriorhodopsin reference genes using Bowtie2, and expression is quantified as FPKM normalized by total raw read counts.
 
-for i in $(cat sample_id); do
-DAS_Tool -i 06.das_tool/${i}_maxbin.scaffolds2bin.tsv,06.das_tool/${i}_metabat2.scaffolds2bin.tsv,06.das_tool/${i}_concoct.scaffolds2bin.tsv -l maxbin,metabat,concoct -c 03.seqtk_results/${i}_l.fa -o 06.das_tool_results/${i} --threads 40 --write_bins --score_threshold 0
-done
+Input layout:
 
+```text
+18.metatranscriptome/
+├── 00.rawdata/
+│   ├── RNA_sampleA_1.fastq.gz
+│   └── RNA_sampleA_2.fastq.gz
+└── references/
+    ├── beta_carotene_dioxygenase.fa
+    └── bacteriorhodopsin.fa
 ```
 
-## 6. MAG Quality Assessment
+Commands:
 
-```sh
-# MAG quality was assessed using both CheckM and CheckM2. Initially, MAGs were filtered based on quality estimates using CheckM2. Those that met the thresholds were subsequently validated with CheckM1. Only MAGs that passed the quality criteria of both CheckM2 and CheckM1 were retained for downstream analyses
+```bash
+cd 18.metatranscriptome
 
-##checkM2
-checkm2 predict --threads 40 -x fa -i 07.MAG_all -o 08.checkM2
-#checkM1
-concat () {
-checkm lineage_wf -x fa 09.MAG_checkM2 10.checkm1/${1} -t 20 --tmpdir bin_checkm.tmp --pplacer_threads 20
-}
-export -f concat
-cat tmp | parallel -j 4 concat {}
+mkdir -p 01.references 02.clean_reads 03.bowtie 04.stat 05.counts
+cat references/beta_carotene_dioxygenase.fa references/bacteriorhodopsin.fa \
+  > 01.references/retinal_phototrophy_genes.fa
+
+find 00.rawdata -name "*_1.fastq.gz" -type f \
+  | sed 's#^00.rawdata/##; s#_1.fastq.gz$##' \
+  | sort > sample_ids.txt
+
+parallel -j "${JOBS}" \
+  'trim_galore --paired --gzip -q 20 -o 02.clean_reads \
+    00.rawdata/{1}_1.fastq.gz 00.rawdata/{1}_2.fastq.gz' \
+  :::: sample_ids.txt
+
+bowtie2-build -f 01.references/retinal_phototrophy_genes.fa 01.references/retinal_phototrophy_genes
+
+while read -r id; do
+  raw_lines=$(zcat "02.clean_reads/${id}_1_val_1.fq.gz" | wc -l)
+  total_reads=$((raw_lines / 4))
+
+  bowtie2 \
+    -x 01.references/retinal_phototrophy_genes \
+    -1 "02.clean_reads/${id}_1_val_1.fq.gz" \
+    -2 "02.clean_reads/${id}_2_val_2.fq.gz" \
+    -S "03.bowtie/${id}.sam" \
+    -p "${THREADS}" \
+    --very-sensitive-local \
+    --no-mixed \
+    --no-discordant \
+    2> "04.stat/${id}.bowtie2.stat"
+
+  samtools view -@ "${THREADS}" -bS "03.bowtie/${id}.sam" \
+    | samtools sort -@ "${THREADS}" -o "03.bowtie/${id}.sorted.bam"
+  samtools index "03.bowtie/${id}.sorted.bam"
+  samtools idxstats "03.bowtie/${id}.sorted.bam" > "05.counts/${id}.idxstats.tsv"
+
+  awk -v total="${total_reads}" 'BEGIN{OFS="\t"; print "gene","length_bp","count","FPKM"}
+    $1 != "*" {
+      fpkm = ($3 * 1e9) / (total * $2)
+      print $1, $2, $3, fpkm
+    }' "05.counts/${id}.idxstats.tsv" > "05.counts/${id}.FPKM.tsv"
+done < sample_ids.txt
+
+cd ..
 ```
 
-## 7. Species-level Dereplication with dRep
+## Output summary
 
-```sh
-##Species-level dereplication was conducted using dRep with a 95% average nucleotide identity (ANI) threshold
-dRep dereplicate 11.nr_95/ -g genome_list.txt -p 90 --ignoreGenomeQuality -pa 0.90 -sa 0.95 --S_algorithm fastANI -nc 0.3 --multiround_primary_clustering --primary_chunksize 10000 --genomeInfo genomeInfo.csv
+```text
+01.clean_reads/                 quality-filtered reads
+02.assembly_megahit/            per-sample assemblies
+03.contigs_1500/                contigs longer than 1,500 bp
+04.mapping/                     read mapping, BAM files and depth files
+05.binning/                     MetaBAT2, MaxBin2 and CONCOCT bins
+06.das_tool/                    integrated bins
+09.MAGs/medium_quality/         MAGs passing CheckM1 and CheckM2 thresholds
+10.SGBs/representatives/        representative species-level genome bins
+11.taxonomy_gtdbtk/             GTDB-Tk taxonomy
+12.phylogeny/                   bacterial and archaeal marker-gene trees
+13.BGC/                         antiSMASH BGC predictions
+14.GCF/                         BiG-SCAPE GCF clustering
+15.catalogue_compare/           comparison with external genome catalogues
+16.terpene/                     terpene pathway reconstruction
+17.metatranscriptome/           RNA validation of retinal-based phototrophy
 ```
 
-## 8. Taxonomic Assignment Using GTDB-Tk
+## Citation and data
 
-```sh
-#The taxonomic affiliation of the dereplicated MAGs was determined using GTDB-Tk (Genome Taxonomy Database Toolkit), which assigns standardized taxonomy based on the GTDB reference database.
-gtdbtk classify_wf --genome_dir 11.nr_95/dereplicated_genomes/ --out_dir 12.taxa_gtdb --cpus 85 --pplacer_cpus 85 --skip_ani_screen --extension fa
-```
+SEGC was constructed from 1,462 metagenomic samples spanning seven extreme habitats: acid mine, cryosphere, deep sea, hot spring, hydrothermal plume, saline-alkaline and subsurface. The manuscript reports 54,661 medium-quality MAGs, 21,805 SGBs and 162,855 BGCs.
 
-## 9.tRNA and rRNA Identification
-
-```sh
-###rRNA
-for i in $(cat bac.MAG.id); do
-barrnap --kingdom bac --threads 50 --outseq 13.RNA/01.rRNA/${i}_rRNA.fasta --quiet 04.MAG/${i}.fa --reject 0.01 –e-value 1e-3  > 13.RNA/01.rRNA/${i}_rRNA.gff3
-done
-for i in $(cat arc.MAG.id); do
-barrnap --kingdom arc --threads 50 --outseq 13.RNA/01.rRNA/${i}_rRNA.fasta --quiet 04.MAG/${i}.fa --reject 0.01 –e-value 1e-3  > 13.RNA/01.rRNA/${i}_rRNA.gff3
-done
-###tRNA
-concat () {
-tRNAscan-SE -A -o 13.RNA/02.tRNA/${1}_tRNA.out -f 13.RNA/02.tRNA/${1}_tRNA.ss -m 13.RNA/02.tRNA/${1}_tRNA.stats 04.MAG/${1}.fa 
-}
-export -f concat
-cat MAG_id | parallel --tmpdir ~/autodl-tmp/123 -j 30 concat {}
-
-```
-
-## 10.Prediction of Microbial Optimal Growth Temperatures
-
-```sh
-##To infer the thermal preferences of the recovered MAGs, the optimal growth temperature (OGT) for each genome was predicted using MetaThermo.
-concat () {
-python ./meta-thermo-main/metathermo.py -f 04.MAG/${1}.fa -t fna
-mv MPT_output.csv 14.metathermo.out/${1}.thermo.csv
-}
-export -f concat
-cat MAG_id | parallel -j 50 concat {}
-```
-
-## 11.Phylogenetic Analysis
-
-```sh
-#Phylogenetic trees were constructed based on concatenated protein sequences generated by GTDB-Tk. The phylogenies included archaeal and bacterial MAGs from the SEMGC dataset, as well as reference genomes from the GTDB. Separate phylogenetic trees were generated for bacteria and archaea by combining SEMGC MAGs with corresponding GTDB reference species.
-##cope file
-cp 12.taxa_gtdb/align/gtdbtk.bac120.user_msa.fasta.gz 15.tree/
-cp 12.taxa_gtdb/align/gtdbtk.ar53.user_msa.fasta.gz 15.tree/
-cp 12.taxa_gtdb/align/gtdbtk.ar53.msa.fasta.gz 15.tree/
-cp 12.taxa_gtdb/align/gtdbtk.bac120.msa.fasta.gz 15.tree/
-##Alignment trimming was performed using BMGE
-bmge -i gtdbtk.ar53.user_msa.fasta -t AA -g 0.5 -h 1 -b 1 -w 1 -of gtdbtk.ar53_trimmed.fasta
-bmge -i gtdbtk.bac120.user_msa.fasta -t AA -g 0.5 -h 1 -b 1 -w 1 -of gtdbtk.bac120_trimmed.fasta
-bmge -i gtdbtk.ar53.msa.fasta -t AA -g 0.5 -h 1 -b 1 -w 1 -of gtdbtk.ar53_msa_trimmed.fasta
-bmge -i gtdbtk.bac120.msa.fasta -t AA -g 0.5 -h 1 -b 1 -w 1 -of gtdbtk.bac120_msa_trimmed.fasta
-##Phylogenetic trees were constructed using FastTree
-FastTree gtdbtk.ar53_trimmed.fasta > ar53_SEMGC_gtdb.tree
-FastTree gtdbtk.bac120_trimmed.fasta > bac120_SEMGC_gtdb.tree
-FastTree gtdbtk.ar53_msa_trimmed.fasta > ar53_msa_gtdb.tree
-FastTree gtdbtk.bac120_msa_trimmed.fasta > bac120_msa_gtdb.tree
-```
-
-## 12.Pangenome Analysis
-
-```sh
-#Gene families were analyzed through a pangenome approach and subsequent clustering. Coding sequences were first predicted for each genome using Prodigal (meta mode), generating protein, nucleotide, and GFF files for downstream analyses. Homologous gene families were then clustered using OrthoFinder for each species group. To examine gene family evolution, CAFE5 was used to estimate gene family expansion and contraction events based on gene count matrices and ultrametric species trees. For single-nucleotide variant (SNV) detection, whole-genome alignments were performed using nucmer with an all-vs-all strategy. The resulting SNV positions were summarized with custom scripts to generate reference-based SNP matrices. To assess selection pressure at the gene level, SNV sites were annotated relative to gene models, and pN/pS ratios were calculated for each gene using a custom pipeline. For each genome, annotated SNVs were mapped onto coding regions using the GFF annotations and reference FASTA files. Subsequently, gene IDs and corresponding protein sequences were appended to the pN/pS tables. Genes with elevated pN/pS ratios were extracted and functionally annotated using eggNOG-mapper.
-##Gene prediction
-concat () {
-prodigal -i ../04.MAG/${1}.fa -a 01.protein/${1}.proteins.faa -d 02.gene/${1}.gene.fasta -p meta -f gff > 03.gff/${1}.gff
-}
-export -f concat
-cat ../genome.id | parallel -j 86 concat {}
-##OrthoFinder: homologous gene family clustering
-concat () {
-orthofinder -t 8 -f 04.species.protein/${1}/ -o 05.orthofinder/${1} -a 8
-}
-export -f concat
-cat species.3_id | parallel -j 10 concat {}
-##CAFE5: gene family expansion and contraction analysis
-for i in $(cat species.3_id); do
-cafe5 -i 06.add_desc/${i}.orthogroups_counts_with_desc.tsv -t 07.tree/${i}.SpeciesTree_ultrametric.txt -o 08.cafe5/${i}.out -c 0 -p -k 2
-done
-##Whole-genome alignment using nucmer
-concat () {
-./all_vs_all_nucmer.py -g ../03.genome/${1}/ -o 09.mummer/${1}_output
-}
-export -f concat
-cat species.3_id | parallel -j 80 concat {}
-##Summarize SNPs
-for i in $(cat species.3_id); do
-python generate_snp_matrix_by_ref.py -i 09.mummer/${i}_output/snps -o 08.snp_tables_by_ref/
-done
-###Calculate pN/pS
-for i in $(cat ../genome.id); do
-python annotate_snv_by_position.py --snv 08.snp_tables_by_ref/${i}.snp.matrix.tsv --gff 03.gff/${i}.gff --fasta ../04.MAG/${i}.fa -o 09.pspn/${i}
-done
-###Add gene IDs and protein sequences
-for i in $(cat ../genome.id); do
-python ../add_geneinfo_to_pnps.py -i 08.pnps/${i}_gene_level_pnps.tsv -f ../04.protein/${i}.proteins.faa -o 09.final.results/${i}.output.tsv
-done
-###Data extraction
-python parse_pnps.py -i 09.final.results -o 10.analysis
-##Functional annotation
-emapper.py -i 10.analysis/pN2_or_inf_proteins.faa -o 11.eggnog/
-```
-
-## 13.CRISPR-Cas system identification
-
-```sh
-#CRISPR-Cas systems were identified using CRISPRCasTyper
-concat () {
-cctyper 04.MAG/${1}.fa 15.cas/${1}_cctyper_output
-}
-export -f concat
-cat MAG_id | parallel -j 30 concat {}
-```
-
-## 14.Secondary Metabolite Potential Analysis
-
-```sh
-#Potential secondary metabolite biosynthetic gene clusters (BGCs) were predicted using antiSMASH.
-concat () {
-antismash 04.MAG/${i}.fa --taxon bacteria --output-dir 16.BGC/01.antismash/${1} --genefinding-tool prodigal --cb-knownclusters -c 1 --cc-mibig  --fullhmmer
-}
-export -f concat
-cat MAG_id | parallel -j 30 concat {}
-##Completeness
-bigslice -i 02.gbk 03.bigslice.SEMGC.out
-##BiG-SLiCE distance analysis
-#human
-tar -xzvf BGC_All.tar.gz #ABC-HuMi: the Atlas of Biosynthetic Gene Clusters in the Human Microbiome
-bigslice -i input_folder_template_human human --num_threads 60
-bigslice --query 04.complete.BGCs --n_ranks 1 human -t 40
-#ocean
-tar -xzvf antismash-bgcs-genomes-unfiltered.tar.gz
-bigslice -i input_folder_template_ocean ocean --num_threads 60
-bigslice --query 04.complete.BGCs --n_ranks 1 ocean -t 40
-#fermentation food
-bigslice -i input_folder_template_food fermentation --num_threads 60
-bigslice --query 04.complete.BGCs --n_ranks 1 fermentation -t 40
-
-```
-
-## 15.AMP
-
-```sh
-#1.smORF prediction
-concat () {
-macrel get-smorfs -f 04.MAG/${1}.fa -o 17.amp/01.smorf/${1}
-}
-export -f concat
-cat MAG_id | parallel -j 90 concat {}
-#2.AMP prediction using Macrel
-find 01.smorf -type f -name "macrel.out.smorfs.faa" | xargs cat > all.macrel.out.smorfs.faa
-macrel peptides -f all.macrel.out.smorfs.faa -o 02.macrel
-#3.AMP-SEMiner-main
-python AMP-SEMiner-main/End_to_end_Tok_CLS/pre_Token_Byfa.py --input ../02.macrel/macrel_output.fasta --output AMPSEMiner.out_pred.tsv --model_name model_weights/Tok_CLS/epoch15 --batch_size 4 --max_len 300
-#4.ampscannerv2
-python amp_scanner_predict.py ../../02.macrel/macrel_output.fasta TrainedModels/021820_FULL_MODEL.h5
-#5.apex
-python ./apex-main/apex_predict.py -i ../02.macrel/macrel_output.fasta -o apex.out_pred.csv
-#6.PepNet
-python prott5_embedder.py --input ../../../02.macrel/macrel_output.fasta --output macrel_output.h5 --model Rostlab/prot_t5_xl_uniref50
-python predict.py -type AMP -output_path ./ -test_fasta ../../../02.macrel/macrel_output.fasta -feature_file path to macrel_output.h5
-
-```
-
+Raw metagenomic sequencing data for the 115 in-house saline-alkaline soil samples are available under NCBI accession PRJNA1285087. MAG FASTA files and BGC GenBank files are available from Zenodo: https://doi.org/10.5281/zenodo.15788452.
